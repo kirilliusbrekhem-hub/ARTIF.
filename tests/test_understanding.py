@@ -8,6 +8,7 @@ implementation. They never call anything that touches the file system.
 """
 
 import sys
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -214,24 +215,24 @@ class Spy:
 
 class ChainedInterpreterTest(unittest.TestCase):
     def test_first_answer_wins_and_later_interpreters_are_not_asked(self):
-        first = Spy(GoalSpec.decided("g", "a", "first"))
-        second = Spy(GoalSpec.decided("g", "b", "second"))
+        first = Spy(GoalSpec.decided("g", "a", "first", original_text="g"))
+        second = Spy(GoalSpec.decided("g", "b", "second", original_text="g"))
         self.assertEqual(ChainedInterpreter([first, second]).interpret(Request("g")).task_type, "a")
         self.assertEqual((first.calls, second.calls), (1, 0))
 
     def test_none_passes_to_the_next(self):
-        passing, deciding = Spy(None), Spy(GoalSpec.decided("g", "b", "second"))
+        passing, deciding = Spy(None), Spy(GoalSpec.decided("g", "b", "second", original_text="g"))
         self.assertEqual(ChainedInterpreter([passing, deciding]).interpret(Request("g")).task_type, "b")
         self.assertEqual(passing.calls, 1)
 
     def test_unclear_answer_stops_the_chain(self):
-        unclear, later = Spy(GoalSpec.unclear("g", "first", ["no"])), Spy(GoalSpec.decided("g", "b", "s"))
+        unclear, later = Spy(GoalSpec.unclear("g", "first", ["no"], original_text="g")), Spy(GoalSpec.decided("g", "b", "s", original_text="g"))
         spec = ChainedInterpreter([unclear, later]).interpret(Request("g"))
         self.assertTrue(spec.needs_clarification)
         self.assertEqual(later.calls, 0)
 
     def test_invalid_explicit_task_never_falls_through_to_rules(self):
-        rules = Spy(GoalSpec.decided("g", "prepare_project", "rules"))
+        rules = Spy(GoalSpec.decided("g", "prepare_project", "rules", original_text="g"))
         spec = ChainedInterpreter([ExplicitInterpreter(), rules]).interpret(
             Request("Prepare my project folder", "nope"))
         self.assertTrue(spec.needs_clarification)
@@ -244,7 +245,7 @@ class ChainedInterpreterTest(unittest.TestCase):
         self.assertTrue(ChainedInterpreter([]).interpret(Request("g")).needs_clarification)
 
     def test_empty_goal_is_refused_before_any_interpreter_runs(self):
-        spy = Spy(GoalSpec.decided("g", "a", "s"))
+        spy = Spy(GoalSpec.decided("g", "a", "s", original_text="g"))
         for text in ("", "   ", "\n\t"):
             with self.subTest(text=text):
                 spec = ChainedInterpreter([spy]).interpret(Request(text, "prepare_project"))
@@ -396,6 +397,49 @@ class DiscoveryTest(unittest.TestCase):
         self.assertTrue(any(i.startswith("tests.test_types.") for i in found))
         self.assertTrue(any(i.startswith("tests.test_understanding.") for i in found))
         self.assertFalse([i for i in found if "_FailedTest" in i or "ModuleImportFailure" in i])
+
+
+class OriginalTextBoundaryTest(unittest.TestCase):
+    """Q1: every interpreter keeps Request.text exactly in GoalSpec.original_text."""
+
+    ORIGINALS = ["  Prepare   my\nproject folder  ", "Create a launch\tchecklist", "Make me a sandwich",
+                 "Prepare my project folder and a checklist", "Pre\u0301pare my project folder",
+                 "", "   ", "\u3000", "checklist \U0001f680"]
+
+    def interpreters(self):
+        return [ExplicitInterpreter(), RuleInterpreter(), default_interpreter(), ChainedInterpreter([])]
+
+    def test_every_result_keeps_the_exact_original(self):
+        for original in self.ORIGINALS:
+            for task in (None, "prepare_project", "not_a_task"):
+                for interpreter in self.interpreters():
+                    with self.subTest(original=original, task=task, interpreter=type(interpreter).__name__):
+                        spec = interpreter.interpret(Request(original, task))
+                        if spec is None:  # ExplicitInterpreter passes when there's no --task.
+                            continue
+                        self.assertEqual(spec.original_text, original)
+                        self.assertEqual(spec.text, unicodedata.normalize("NFC", " ".join(original.split()))
+                                         if original.split() else "")
+
+    def test_text_is_nfc(self):
+        spec = default_interpreter().interpret(Request("Pre\u0301pare my project folder"))
+        self.assertTrue(unicodedata.is_normalized("NFC", spec.text))
+        self.assertEqual(spec.text, "Pr\u00e9pare my project folder")
+
+    def test_decomposed_input_is_classified_like_its_nfc_form(self):
+        interpreter = default_interpreter()
+        for goal in PARITY_GOALS:
+            decomposed = unicodedata.normalize("NFD", goal)
+            with self.subTest(goal=goal):
+                from_nfd = interpreter.interpret(Request(decomposed))
+                from_nfc = interpreter.interpret(Request(goal))
+                self.assertEqual((from_nfd.task_type, from_nfd.text, from_nfd.ambiguities, from_nfd.candidates),
+                                 (from_nfc.task_type, from_nfc.text, from_nfc.ambiguities, from_nfc.candidates))
+                self.assertEqual(from_nfd.original_text, decomposed)
+
+    def test_parity_corpus_is_nfc(self):
+        # The 0.3 parity results above stay exact because every corpus goal is already NFC.
+        self.assertEqual([g for g in PARITY_GOALS if not unicodedata.is_normalized("NFC", g)], [])
 
 
 if __name__ == "__main__":
