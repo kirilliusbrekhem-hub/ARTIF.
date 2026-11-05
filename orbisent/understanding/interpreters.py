@@ -20,6 +20,12 @@ through to the keyword rules.
 Every interpreter refuses an empty goal in the same way, whether it is used on
 its own or inside a chain. Each one checks its configuration when it is built
 and keeps it read-only afterwards.
+
+Every GoalSpec keeps the user's exact input in `original_text` (Request.text).
+Its `text`, which keywords are matched against, is normalize_goal_text(original):
+Unicode NFC, then whitespace collapsed. For NFC input (almost all real input)
+this is exactly Prototype 0.3's clean_goal; for decomposed input, canonically
+equivalent text is now classified the same way as its NFC form.
 """
 
 import re
@@ -27,7 +33,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Optional, Protocol, Sequence
 
-from orbisent.types import GoalSpec, Request
+from orbisent.types import GoalSpec, Request, normalize_goal_text
 
 # The task types Orbisent knows, with the keywords that point to each one.
 # Copied from Prototype 0.3 (prototype/orbisent_agent.py, TASK_TYPES). The order matters:
@@ -49,15 +55,18 @@ _KEYWORD_PATTERN = re.compile(r"[a-z0-9]+( [a-z0-9]+)*")
 
 
 def clean_goal(text):
-    """Collapse all whitespace (including newlines) so the goal fits on one line (from 0.2)."""
+    """Collapse all whitespace (including newlines) so the goal fits on one line (from 0.2).
+
+    Kept for compatibility. Interpreters use normalize_goal_text(), which also applies NFC.
+    """
     return " ".join(text.split())
 
 
-def refuse_empty(text, source):
-    """Return an unclear GoalSpec if the cleaned goal text is empty, otherwise None."""
+def refuse_empty(text, source, *, original_text):
+    """Return an unclear GoalSpec if the normalised goal text is empty, otherwise None."""
     if text:
         return None
-    return GoalSpec.unclear(text, source, [EMPTY_GOAL_REASON])
+    return GoalSpec.unclear(text, source, [EMPTY_GOAL_REASON], original_text=original_text)
 
 
 def _words(text):
@@ -109,15 +118,16 @@ class ExplicitInterpreter:
     def interpret(self, request):
         if request.explicit_task is None:
             return None
-        text = clean_goal(request.text)
-        empty = refuse_empty(text, self.source)
+        text = normalize_goal_text(request.text)
+        empty = refuse_empty(text, self.source, original_text=request.text)
         if empty:
             return empty
         if request.explicit_task not in self._task_types:
             known = ", ".join(self._task_types)
             return GoalSpec.unclear(text, self.source,
-                                    [f"unknown task type {request.explicit_task!r} (known: {known})"])
-        return GoalSpec.decided(text, request.explicit_task, self.source)
+                                    [f"unknown task type {request.explicit_task!r} (known: {known})"],
+                                    original_text=request.text)
+        return GoalSpec.decided(text, request.explicit_task, self.source, original_text=request.text)
 
 
 class RuleInterpreter:
@@ -166,18 +176,19 @@ class RuleInterpreter:
                 if any(f" {keyword} " in words for keyword in keywords)]
 
     def interpret(self, request):
-        text = clean_goal(request.text)
-        empty = refuse_empty(text, self.source)
+        text = normalize_goal_text(request.text)
+        empty = refuse_empty(text, self.source, original_text=request.text)
         if empty:
             return empty
         found = self.matches(text)
         if len(found) == 1:
-            return GoalSpec.decided(text, found[0], self.source)
+            return GoalSpec.decided(text, found[0], self.source, original_text=request.text)
         if found:
             return GoalSpec.unclear(text, self.source,
                                     [f"it matches more than one task type ({', '.join(found)})"],
-                                    candidates=found)
-        return GoalSpec.unclear(text, self.source, ["it does not match any task type Orbisent knows"])
+                                    candidates=found, original_text=request.text)
+        return GoalSpec.unclear(text, self.source, ["it does not match any task type Orbisent knows"],
+                                original_text=request.text)
 
 
 class ChainedInterpreter:
@@ -202,8 +213,8 @@ class ChainedInterpreter:
         return self._interpreters
 
     def interpret(self, request):
-        text = clean_goal(request.text)
-        empty = refuse_empty(text, self.source)
+        text = normalize_goal_text(request.text)
+        empty = refuse_empty(text, self.source, original_text=request.text)
         if empty:
             return empty
         for interpreter in self._interpreters:
@@ -213,7 +224,8 @@ class ChainedInterpreter:
                     raise TypeError(f"{type(interpreter).__name__} returned {type(result).__name__}, "
                                     "not a GoalSpec or None")
                 return result
-        return GoalSpec.unclear(text, self.source, ["no interpreter could classify the goal"])
+        return GoalSpec.unclear(text, self.source, ["no interpreter could classify the goal"],
+                                original_text=request.text)
 
 
 def default_interpreter():

@@ -278,6 +278,10 @@ Implementations, tried in order by a `ChainedInterpreter`:
 If no interpreter decides, the user gets the 0.2 behaviour: an explanation, the list of task types and a
 `--task` example. **Nothing is created on a guess.**
 
+> **ARTIF. 1.0 update (Q1):** `GoalSpec` now also has a required `original_text` field holding `Request.text`
+> exactly, and `text` is `normalize_goal_text(original_text)`: Unicode NFC, then whitespace collapsed. The
+> factories take `original_text=` as a keyword argument. See §12.4.
+
 ### 4.4 Intelligent task planning
 
 **Responsibility:** turn a `GoalSpec` into a `Plan`, then prove the plan is acceptable before anyone sees it.
@@ -327,6 +331,10 @@ class Planner(Protocol):
 
 "Intelligent" in 1.0 means *the slot exists and is safe*. Plans are template-based until a real model is added
 in Phase 4, and the docs must say so.
+
+> **ARTIF. 1.0 update (Planning Engine Revision 3):** the approved planning data contract, dependency rules,
+> parameter provenance, `PlanningResult` and the complete validation rules are in **§12**. Steps may declare
+> dependencies on earlier steps; execution stays linear. Plans contain `PlanGoal`, not `GoalSpec`.
 
 ### 4.5 Tool registry
 
@@ -439,6 +447,9 @@ Verification has four layers:
 4. **Model review** (future, advisory only): a model may comment on quality ("the checklist has no testing
    section"). Its comments appear in the report as notes. **They can never turn a failure into a success.**
    They also can't turn a success into a failure unless a deterministic check agrees.
+
+> **ARTIF. 1.0 update:** `CheckSpec.params` is a `FrozenMap` (not a tuple of pairs), and the exact check kinds
+> and parameters are listed in §12.5.
 
 **Reporting rule (from 0.3):** the run is `SUCCESS` only if no step failed and every acceptance check passed.
 The report always lists every step with its status, result and problems, and says which layer found each problem.
@@ -610,6 +621,10 @@ Execution runs the snapshot, never the planner's objects.
 
 What this does and doesn't prove: the hash guarantees that the steps executed are byte-for-byte the steps
 approved. It doesn't make the plan itself safe; that's the validator's and the permission policy's job.
+
+> **ARTIF. 1.0 update:** plans contain no floats; the goal's confidence is stored as an integer per-mille value
+> (§12.7). Python's `hash()` is never used as plan identity. The value rules a canonical serializer can rely on
+> are in §12.4.
 
 #### 4.8.5 Audit log
 
@@ -942,6 +957,8 @@ Decisions proposed in this document:
    `prototype/` into a thin layer over `orbisent/` later, which changes existing files and needs a separate decision.
 2. **Plans are linear in 1.0.** Steps run in order, as in 0.3. Dependency graphs and parallel steps wait until a
    real planner needs them.
+   *Amended by Planning Engine Revision 3 (§12.2):* execution stays linear, but steps may declare dependencies on
+   earlier steps, and those dependencies must be complete. Parallel execution would need a new `format_version`.
 3. **The model is advisory.** It never executes, approves or verifies.
 4. **Standard library only in the core.** Model providers use `urllib` over HTTP rather than SDKs where possible.
 5. **Strong sandbox on POSIX only.** Linux and macOS get the descriptor-based, no-follow sandbox (§4.8.1).
@@ -979,3 +996,189 @@ Open questions for the project owner:
 - Verification checks structure and facts, such as files existing and sections present. It can't judge whether
   the content is good; that's what the optional model review is for, and it's advisory only.
 - There's no memory, routing, voice, scheduling or integrations in 1.0. Those are designed for, but not built.
+
+---
+
+## 12. ARTIF. 1.0 Planning Foundation (Planning Engine Revision 3, PR 1)
+
+This section records the approved Planning Engine design (Revision 3, decisions U1–U4 and Q1–Q3) and what
+Planning Foundation PR 1 implements. It amends §4.3, §4.4, §4.7 and §4.8.4 where noted there; earlier text is
+kept for history. The product name is **ARTIF.**; the Python package and imports remain **`orbisent`**.
+
+### 12.1 Status
+
+| Part | Status |
+| --- | --- |
+| Immutable plan types, the `original_text` field, confidence conversion (`orbisent/types.py`) | Implemented (PR 1) |
+| Tool descriptors and argument specifications (`orbisent/tools/`) | Implemented (PR 1): data only, no tool code |
+| Lexical path checks (`orbisent/safety/sandbox.py`) | Implemented (PR 1): string checks only, not a sandbox |
+| `PlanValidator`, `describe_expected` (`orbisent/planning/validator.py`) | Implemented (PR 1) |
+| `TemplatePlanner`, `PlanningContext`, templates, derivation registry, `folder_name_from_text.v1` | Designed (§12.6); PR 2 |
+| Canonical serialisation, SHA-256 plan identity, approval, execution, verification, CLI | Postponed |
+
+### 12.2 Stages and boundaries
+
+```
+Request -> GoalSpec -> Planning Engine -> Plan -> Approval -> Execution -> Verification
+           (§4.3)      [planner + PlanValidator]
+```
+
+- **Planning** turns an already understood goal into a validated plan, or returns `needs_input` / `refused`.
+  It is pure: it never reads or writes files, never uses the network, never reads the clock (the caller passes
+  `today`), and never runs a tool. It never guesses: a value can only come from the user, a documented and
+  versioned derivation rule, a documented default, or the caller's context, and every such value is recorded
+  with its provenance.
+- **Approval** (Phase 2, §4.8.4) shows the plan and binds the user's approval to it.
+- **Execution** runs the approved steps one at a time, in plan order, and stops at the first failure.
+- **Verification** runs step checks and acceptance checks against the results.
+
+Plans are **linear in execution order** in ARTIF. 1.0. A step may **declare dependencies on earlier steps**;
+dependencies must be complete (§12.5). A future parallel scheduler would need a new `format_version`.
+
+### 12.3 Components (PR 1)
+
+- **Plan types** (`orbisent/types.py`): `CheckSpec`, `PlanGoal`, `ResolvedParameter`, `PlanStep`, `Plan`,
+  `MissingInput`, `ValidationIssue`, `PlanningResult`, plus `normalize_goal_text()` and
+  `confidence_to_permille()`. All are frozen dataclasses; nested values are copied into tuples and `FrozenMap`s.
+- **Tool descriptors** (`orbisent/tools/`): `Permission`, `ArgSpec` (`max_length` counts UTF-8 bytes),
+  `ToolInfo`, and descriptors for `fs.create_folder`, `fs.create_file`, `fs.read_file`, `fs.list_dir`.
+  `ARTIF_1_0_PERMISSIONS = {READ, CREATE}`. A descriptor holds no code.
+- **Lexical paths** (`orbisent/safety/sandbox.py`): `check_relative_path()`, `path_key()`, `parent_keys()`.
+- **Validator** (`orbisent/planning/validator.py`): `PlanValidator(catalog, allowed_permissions, known_rules,
+  limits)`, `ValidationLimits`, `describe_expected()`. The catalog may contain only the built-in descriptors
+  (any subset), unchanged; anything else is a configuration error. `ValidationLimits` lives here rather than in
+  PR 2's context module, because the validator needs it first.
+
+### 12.4 Data contract and value rules
+
+**Goal text (Q1).** `GoalSpec.original_text` and `PlanGoal.original_text` hold the user's input exactly as given
+(`Request.text`, with its spacing and Unicode form). `text` is `normalize_goal_text(original_text)`: Unicode **NFC
+only** (never NFKC), then whitespace collapsed to single spaces. `GoalSpec` rejects any `text` that is not exactly
+that, so the two can't drift apart. Interpreters classify `text`, so canonically equivalent (composed and
+decomposed) inputs are classified identically. For NFC input this is exactly Prototype 0.3's behaviour.
+
+**Plan value rules.** Every value inside plan data is one of:
+
+- `str`: exact type, valid Unicode (no lone surrogates), NFC, and no control characters except newline and tab.
+  Exempt from NFC and control-character rules (but not from the surrogate rule): `PlanGoal.original_text`,
+  `MissingInput.original` and `MissingInput.lost`, because they preserve the user's exact input;
+- `int`: exact type (not `bool`), within ±(2⁵³ − 1);
+- `bool`; `None` only where a field is optional;
+- `tuple` (a list is copied into a tuple; sets, generators, strings and dicts are rejected);
+- `FrozenMap` with `str` keys and the scalar values above.
+
+Floats are never allowed in plan data. Unsupported values are rejected, never coerced.
+
+**Ordering.** Tuple order is meaningful (steps, checks, acceptance checks). `depends_on` must list each step once,
+in plan order. `parameters` must be sorted by name. `FrozenMap` key order carries no meaning.
+
+**Optional values.** Every field is always present; `None` means "not applicable". Adding a field needs a new
+`format_version`.
+
+**Equality and identity.** Tests use `==` for determinism. Python's `hash()` is randomised per process and is used
+only for in-memory sets and dictionaries; it is never stored, displayed or used as plan identity. Persistent
+identity will be SHA-256 over canonical bytes (§4.8.4), which is not implemented yet.
+
+### 12.5 Validation rules
+
+The validator returns every issue, never raises for a bad plan, and orders issues deterministically: plan-level
+issues, then each step in plan order, then acceptance checks.
+
+| Area | Rule | Code |
+| --- | --- | --- |
+| Plan | `format_version == 1` | `unsupported_format` |
+| | 1 to 50 steps (`ValidationLimits.max_steps`) | `no_steps` / `too_many_steps` |
+| | `source` is `template:<goal.task_type>` or `model:<non-empty id>` | `bad_source` |
+| | Parameters sorted by name, each name once | `parameter_order` / `duplicate_parameter` |
+| | Provenance consistent: `derived` has `rule` and `rule_input`; `context` has `input_source` and no rule; `user` and `default` have no `rule` or `rule_input` | `bad_provenance` |
+| | A derived parameter's rule is in `known_rules` | `unknown_rule` |
+| | All plan text at most 1 MiB (UTF-8) | `plan_too_large` |
+| | `confidence_permille` from 1 to 1000; `text == normalize_goal_text(original_text)` | `bad_goal` |
+| Step | Id matches `[a-z][a-z0-9_-]{0,31}`, and is unique | `bad_step_id` / `duplicate_step_id` |
+| | Description: non-empty, one line, at most 200 characters | `bad_description` |
+| | `expected == describe_expected(step, catalog)` (Q2) | `expected_mismatch` |
+| Tool | Tool is in the catalog | `unknown_tool` |
+| | Its permission is allowed | `permission_denied` |
+| | Arguments: required ones present, no others, strings within `max_length` | `missing_arg` / `unexpected_arg` / `bad_arg` |
+| | Text content at most 64 KiB (UTF-8) | `content_too_large` |
+| Paths | Lexical rules (below) for `target_path` and `source_path` | `path_invalid` |
+| | No two steps target the same path (NFC + case-folded, part by part) | `duplicate_target` |
+| Dependencies | Each entry names an existing, earlier step; not itself; listed once, in plan order | `unknown_dependency` / `forward_dependency` / `self_dependency` / `dependency_order` |
+| | A step whose target lies inside a path another step targets, or whose source is (or lies inside) such a path, must depend on that step, directly or indirectly | `missing_dependency` |
+| | ...and that step must come earlier | `order_violation` |
+| Checks | Known kind with exactly its parameters | `bad_check` |
+| | Only on steps whose tool produces content | `check_on_non_content_step` |
+| | At most 20 per step | `too_many_checks` |
+| | Acceptance checks name a `target` that some step creates | `bad_acceptance` |
+
+Check kinds: `not_empty` (no parameters), `title_starts_with` and `contains` (`text`: a non-empty single line),
+`min_count` (`pattern`: `checkbox`, `numbered_step` or `section`, never a regular expression; `minimum`: an int
+from 1 to 10,000).
+
+**Lexical path rules** (`check_relative_path`): a non-empty, NFC, valid-Unicode string; no NUL or control
+character, no `\`, no `:`; not starting with `/`; at most 1024 UTF-8 bytes; every `/`-separated part non-empty,
+not `.` or `..`, at most 255 UTF-8 bytes, not ending in a dot or space, and not a Windows-reserved device name
+(`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, with or without an extension).
+
+These checks look at strings only. **They are not a sandbox and do not replace one**: they can't see symlinks,
+hard links, mount points or races. The descriptor-based no-follow walk of §4.8.1 protects the file system at run
+time and arrives with the execution engine.
+
+### 12.6 Parameter derivation (designed; implemented in PR 2)
+
+Only documented, versioned, pure rules may derive values, and each derived value records its rule id, its input
+and its input source. The first rule, **`folder_name_from_text.v1`**:
+
+1. The input is `--name` if given, otherwise the goal text. A rejected `--name` never falls back to the goal text.
+2. Every character must be either an ASCII letter or digit (letters are lowercased), or a **separator** from this
+   exact list (Q3): whitespace, `-`, `_`, `.`, `,`, `:`, `;`, `!`, `?`, `'`, `"`, `(`, `)`. Consecutive separators
+   collapse into one `-`; leading and trailing separators are removed.
+3. If any other character would be lost (U1 = B), or the result is empty, or longer than 50 characters, the result
+   is `needs_input`, with the original input preserved in `MissingInput.original` and the lost characters listed
+   in `MissingInput.lost`. Nothing is silently shortened or replaced.
+
+Examples: `"My Project"` → `my-project`; `"!!!"` → `needs_input`; `"проект checklist"` → `needs_input`.
+
+### 12.7 Confidence (U3)
+
+`GoalSpec.confidence` stays a float. `PlanGoal.from_goal_spec()` is the only place it changes: it becomes
+`confidence_permille`, an int, by `confidence_to_permille()`. The rule takes `repr(c)` (the shortest decimal that
+round-trips the float), multiplies by 1000 in exact decimal arithmetic with a fixed decimal context, and rounds with
+`ROUND_HALF_UP`. Examples: 0.85 → 850, 0.0005 → 1, 0.0004 → 0, 0.9995 → 1000. Only an exact int or float in
+[0, 1] is accepted (not `bool`, NaN, infinities or −0.0). A decided goal that converts to 0 is representable and is
+then refused by the validator with `bad_goal`; it is never raised to 1.
+
+The planner and future converters receive a `GoalSpec` (float). The validator and the future canonical serializer
+receive a `Plan`, which contains no floats.
+
+### 12.8 Expected descriptions (Q2)
+
+`step.expected` must equal `describe_expected(step, catalog)` exactly. The wording is fixed per tool, and for
+created files it is generated from the step's checks in the same words as Prototype 0.3:
+
+| Tool | Expected text |
+| --- | --- |
+| `fs.create_folder` | `<path> exists and is a folder` |
+| `fs.create_file`, no checks | `<file name> exists and is a file` |
+| `fs.create_file`, with checks | `<file name> exists; ` + each check in order: `its first line starts with '<t>'`, `it contains '<a>', '<b>'` (a run of `contains` checks is grouped), `it is not empty`, `at least <n> checkbox items` / `numbered steps` / `'## ' sections` |
+| `fs.read_file` | `<path> exists and is a file that can be read` |
+| `fs.list_dir` | `<path> exists and is a folder that can be listed` |
+
+Paths in plans are workspace-relative, so a folder's expected text no longer includes the base folder that 0.3
+printed (`orbisent_projects/…`).
+
+### 12.9 Model-made plans
+
+A future model-based planner produces only data, parsed strictly into these same types, and every such plan goes
+through **the same `PlanValidator` with the same catalog, permissions, rules and limits** as template plans. A model
+can choose among existing tools, check kinds and rule ids, but can't add new ones. The `source` field is a label,
+not a privilege.
+
+### 12.10 How the no-I/O guarantee is tested
+
+Behaviourally, in `tests/support.py`: inside `forbid_side_effects()`, an audit hook refuses file, directory, socket,
+subprocess and similar events; operations without audit events (`os.stat`-style checks, `getcwd`, every `time`
+clock) are patched to fail; `datetime.date.today()` / `datetime.datetime.now()` fail; and names a module imported
+directly (`from time import time`) are replaced too. Every attempt is recorded even if swallowed. Tests run the
+validator on normal and adversarial plans (traversal, absolute paths, paths that exist on disk, unknown tools)
+inside the guard and require zero attempts; separate tests prove the guard catches each kind of access.
